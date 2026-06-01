@@ -35,6 +35,11 @@ export function parseAction(raw: unknown): Action {
         reason: optStr(o.reason),
       };
     }
+    case "search": {
+      const query = String(o.query ?? o.text ?? "").trim();
+      if (!query) throw new Error("search action missing query");
+      return { type, query, reason: optStr(o.reason) };
+    }
     case "scroll": {
       const direction = o.direction === "up" ? "up" : "down";
       const id = toNum(o.id);

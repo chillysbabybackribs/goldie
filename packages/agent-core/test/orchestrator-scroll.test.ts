@@ -58,6 +58,10 @@ class RecordingDriver implements BrowserDriver {
   async pressEnter(id: number) {
     this.calls.push(`pressEnter:${id}`);
   }
+  async search(query: string) {
+    this.calls.push(`search:${query}`);
+    return true;
+  }
   async scroll(direction: "down" | "up") {
     this.calls.push(`scroll:${direction}`);
   }
@@ -123,6 +127,37 @@ describe("orchestrator scroll action", () => {
     expect(driver.calls).toContain("scrollIntoView:100");
     const scrollStep = result.steps.find((s) => s.action.type === "scroll");
     expect(scrollStep?.outcome).toBe("scrolled element 1 into view");
+  });
+
+  it("routes a search action to driver.search in one step", async () => {
+    const driver = new RecordingDriver();
+    const planner = new ScriptedPlanner([
+      { type: "navigate", url: "https://www.google.com" },
+      { type: "search", query: "nebius stock" },
+      { type: "finish", answer: "ok" },
+    ]);
+    const result = await new Orchestrator(planner, driver).run("search it");
+    expect(driver.calls).toContain("search:nebius stock");
+    const step = result.steps.find((s) => s.action.type === "search");
+    expect(step?.outcome).toMatch(/searched for "nebius stock"/);
+  });
+
+  it("reports cleanly when a search finds no box", async () => {
+    class NoBoxDriver extends RecordingDriver {
+      async search(query: string) {
+        this.calls.push(`search:${query}`);
+        return false;
+      }
+    }
+    const driver = new NoBoxDriver();
+    const planner = new ScriptedPlanner([
+      { type: "navigate", url: "https://example.com" },
+      { type: "search", query: "x" },
+      { type: "finish", answer: "ok" },
+    ]);
+    const result = await new Orchestrator(planner, driver).run("search nowhere");
+    const step = result.steps.find((s) => s.action.type === "search");
+    expect(step?.outcome).toMatch(/no search box/i);
   });
 
   it("reports a clean outcome when scrolling an id not on the page", async () => {

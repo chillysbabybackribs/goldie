@@ -42,6 +42,10 @@ export class ElectronCdpDriver implements BrowserDriver {
     await this.browser.pressEnterNode(backendNodeId);
   }
 
+  async search(query: string): Promise<boolean> {
+    return this.browser.search(query);
+  }
+
   async scroll(direction: "down" | "up"): Promise<void> {
     await this.browser.scrollViewport(direction);
   }

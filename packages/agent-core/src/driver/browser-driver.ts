@@ -23,6 +23,13 @@ export interface BrowserDriver {
   type(backendNodeId: number, text: string): Promise<void>;
   /** Press Enter on an element by backend node id (e.g. submit a search). */
   pressEnter(backendNodeId: number): Promise<void>;
+  /**
+   * Deterministically search the current page: find its search box, enter the
+   * query, submit, and wait for results to settle — all internally. Returns
+   * true if a search box was found and used, false if the page has none (so the
+   * orchestrator can report that cleanly). No selectors cross the boundary.
+   */
+  search(query: string): Promise<boolean>;
   /** Scroll the viewport one page in a direction to reveal more content. */
   scroll(direction: "down" | "up"): Promise<void>;
   /** Scroll a specific element (by backend node id) into view. */

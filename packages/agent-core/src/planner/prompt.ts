@@ -15,7 +15,8 @@ Rules:
 - If the goal needs no web browsing (general question, chat), respond with the "answer" action directly. Do not browse unnecessarily.
 - To browse, start with a "navigate" action to a relevant URL.
 - After ANY action you are automatically shown the resulting page outline next turn. NEVER repeat the action you just took — especially do not navigate to a URL you already navigated to. If the outline you were just given already lets you answer the goal, FINISH now; do not take another action first.
-- Use "click" / "type" with an element id from the current outline. For search boxes, "type" with submit:true to run the search.
+- Use "click" / "type" with an element id from the current outline.
+- To search, use the "search" action with a "query" — it finds the page's search box, fills it, submits, and waits for results in ONE step. Prefer this over manually typing into a search box and clicking a Search button.
 - The READABLE CONTENT block is the full page text already — do NOT scroll to read more. Only use "scroll" to bring a specific interactable element into view before clicking it (pass its id); never scroll the viewport hoping text appears.
 - If the page outline says it is blank / has no readable content, do NOT scroll — there is nothing to reveal. Navigate to a different, content-rich URL instead. Never scroll a blank page hoping content appears.
 - Prefer navigating directly to a site that has the answer (e.g. a news site, a specific domain, Wikipedia) over searching on a general search engine, whose results pages are often unreadable to you.
@@ -31,10 +32,15 @@ export const ACTION_SCHEMA = {
   properties: {
     type: {
       type: "string",
-      enum: ["navigate", "click", "type", "scroll", "finish", "answer"],
+      enum: ["navigate", "click", "type", "search", "scroll", "finish", "answer"],
       description: "The single action to take next.",
     },
     url: { type: "string", description: "For 'navigate': the URL to load." },
+    query: {
+      type: "string",
+      description:
+        "For 'search': the text to search for. The page's search box is found, filled, and submitted automatically.",
+    },
     id: {
       type: "number",
       description:

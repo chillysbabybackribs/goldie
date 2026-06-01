@@ -10,6 +10,11 @@ export type Action =
   | { type: "navigate"; url: string; reason?: string }
   | { type: "click"; id: number; reason?: string }
   | { type: "type"; id: number; text: string; submit?: boolean; reason?: string }
+  // Search the CURRENT page deterministically: find its search box, enter the
+  // query, submit, and wait for results — all in ONE step. Use on a page that
+  // has a search box (a site's own search, Google, etc.) instead of manually
+  // type+click-Search-button. The driver owns finding the box and submitting.
+  | { type: "search"; query: string; reason?: string }
   // Scroll the page to reveal more content. `direction` moves the viewport;
   // an optional `id` scrolls that element into view instead (more reliable
   // than guessing pixels). Re-snapshotting next turn shows the new content.

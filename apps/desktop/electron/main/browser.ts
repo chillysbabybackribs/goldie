@@ -127,9 +127,17 @@ export class BrowserManager {
     return { ...ax, text };
   }
 
-  /** Deterministic click by CDP backend node id. */
+  /**
+   * Deterministic click that WAITS for any navigation it triggers. A click on a
+   * link/tab/button often navigates or swaps the view; without this wait the
+   * loop snapshots a blank/mid-load page and the planner has to notice and route
+   * around it (observed: blank-after-click on Yahoo links/tabs, wasted turns).
+   * Now the click leaves a SETTLED, readable page — the LLM never babysits it.
+   */
   async clickNode(backendNodeId: number) {
-    return this.cdpSession().clickBackendNode(backendNodeId);
+    return this.runAndSettle(() =>
+      this.cdpSession().clickBackendNode(backendNodeId),
+    );
   }
 
   /** Type text into a node by backend id. */
@@ -138,28 +146,46 @@ export class BrowserManager {
   }
 
   /**
+   * Deterministic search: find the page's search box, enter the query, submit,
+   * and wait for results to settle — one operation. Returns false if the page
+   * has no usable search box. The planner never operates the box itself.
+   */
+  async search(query: string): Promise<boolean> {
+    return this.runAndSettle(() => this.cdpSession().searchPage(query));
+  }
+
+  /**
    * Press Enter on a node and WAIT for the navigation it triggers (a search
    * submit). Without this wait the loop snapshots the pre-submit page, the
    * planner thinks the submit didn't work, and re-issues it (observed: 5
-   * retries on Google search). We press Enter, then watch for a navigation to
-   * START within a short window: if one does, we wait for it to finish + for
-   * content to paint; if none does (in-page/AJAX search, or a non-navigating
-   * field), we settle briefly and move on. Either way the next snapshot sees
-   * the resulting page.
+   * retries on Google search).
    */
   async pressEnterNode(backendNodeId: number): Promise<void> {
-    const view = this.ensureView();
-    const wc = view.webContents;
+    await this.runAndSettle(() =>
+      this.cdpSession().pressEnterOnBackendNode(backendNodeId),
+    );
+  }
+
+  /**
+   * Run a page interaction, then leave the page in a SETTLED, readable state:
+   * arm a navigation watcher BEFORE the action (so a fast nav can't be missed),
+   * run it, and if a navigation starts within a short window, wait for it to
+   * finish loading + for real content to paint; if none does (in-page/AJAX
+   * update, or a no-op click), settle briefly. This is the shared mechanics +
+   * recovery that keeps the LLM from ever seeing a half-loaded page.
+   *
+   * Returns whatever the action returned (e.g. clickBackendNode's result).
+   */
+  private async runAndSettle<T>(action: () => Promise<T>): Promise<T> {
+    const wc = this.ensureView().webContents;
     const urlBefore = wc.getURL();
 
-    // Arm a navigation watcher BEFORE the keypress so we can't miss a fast nav.
     const navigated = new Promise<boolean>((resolve) => {
       let settled = false;
       const onStart = () => {
         if (settled) return;
         settled = true;
         cleanup();
-        // A navigation began — wait for it to finish loading.
         const onFinish = () => {
           wc.off("did-finish-load", onFinish);
           wc.off("did-fail-load", onFinish);
@@ -177,11 +203,9 @@ export class BrowserManager {
         wc.off("did-start-navigation", onStart);
         wc.off("did-navigate", onStart);
       };
-      // did-start-navigation covers same-doc + cross-doc; did-navigate is the
-      // belt-and-braces fallback for committed loads.
       wc.on("did-start-navigation", onStart);
       wc.on("did-navigate", onStart);
-      // No navigation within this window → assume in-page submit, proceed.
+      // No navigation within this window → in-page update or no-op, proceed.
       setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -190,15 +214,14 @@ export class BrowserManager {
       }, 1200);
     });
 
-    await this.cdpSession().pressEnterOnBackendNode(backendNodeId);
+    const result = await action();
     const didNavigate = await navigated;
     if (didNavigate || wc.getURL() !== urlBefore) {
-      // Real navigation: let client-rendered content paint before snapshotting.
       await this.cdpSession().waitForContent();
     } else {
-      // In-page result update — a short settle for the DOM to mutate.
       await new Promise((r) => setTimeout(r, 400));
     }
+    return result;
   }
 
   /** Scroll the viewport to reveal more content. */

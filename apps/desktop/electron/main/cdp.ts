@@ -48,6 +48,37 @@ function isInteractableRole(role: string): boolean {
 }
 
 /**
+ * Pick the page's best search box from the AX tree, agnostically. Scores each
+ * candidate input: an explicit `searchbox` role wins; a `textbox`/`combobox`
+ * whose name hints at search ranks next; any other text input is a last resort.
+ * Returns the backend node id of the highest scorer, or undefined if none.
+ */
+function pickSearchBox(nodes: AXNode[]): number | undefined {
+  const SEARCHY = /search|find|query|look ?up|keyword/i;
+  let best: { score: number; backendId: number } | undefined;
+
+  for (const n of nodes) {
+    if (n.ignored) continue;
+    const backendId = n.backendDOMNodeId;
+    if (backendId === undefined) continue;
+    const role = roleOf(n);
+    const name = nameOf(n);
+
+    let score = 0;
+    if (role === "searchbox") score = 100;
+    else if (role === "textbox" || role === "combobox")
+      score = SEARCHY.test(name) ? 60 : 20;
+    else continue; // not a text-entry control
+
+    // A search-y name nudges a generic textbox above a non-search one.
+    if (score > 0 && SEARCHY.test(name)) score += 5;
+
+    if (!best || score > best.score) best = { score, backendId };
+  }
+  return best?.backendId;
+}
+
+/**
  * A thin wrapper over Electron's built-in CDP (webContents.debugger). This is
  * the seed of the future `ElectronCdpDriver` that will implement the abstract
  * BrowserDriver interface in agent-core. For now it proves the three things
@@ -165,6 +196,26 @@ export class CdpSession {
     } catch {
       return "";
     }
+  }
+
+  /**
+   * Find the page's primary search box by ACCESSIBILITY ROLE — agnostic, no
+   * per-site selectors. Prefers an explicit `searchbox`; otherwise a `textbox`
+   * or `combobox` whose name/placeholder looks search-related ("search", "find",
+   * "query"); otherwise the first text input on the page. Returns its backend
+   * node id, or undefined if the page has no usable input. Then types the query
+   * and presses Enter (caller wraps in a settle). One deterministic operation.
+   */
+  async searchPage(query: string): Promise<boolean> {
+    await this.enableDomains();
+    const { nodes } = await this.send<{ nodes: AXNode[] }>(
+      "Accessibility.getFullAXTree",
+    );
+    const backendId = pickSearchBox(nodes);
+    if (backendId === undefined) return false;
+    await this.typeIntoBackendNode(backendId, query);
+    await this.pressEnterOnBackendNode(backendId);
+    return true;
   }
 
   /**

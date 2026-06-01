@@ -229,6 +229,16 @@ export class Orchestrator {
           return `typed into element ${action.id}${action.submit ? " and submitted" : ""}`;
         });
 
+      case "search": {
+        // One deterministic operation: the driver finds the search box, enters
+        // the query, submits, and waits for results. The planner never operates
+        // the box itself (no more click-Search-button + retry babysitting).
+        const found = await this.driver.search(action.query);
+        return found
+          ? `searched for "${action.query}" — results page loaded`
+          : `no search box on this page — navigate to a search engine or a site with search, then search`;
+      }
+
       case "scroll": {
         // Element-targeted scroll: bring a specific id into view.
         if (action.id !== undefined) {

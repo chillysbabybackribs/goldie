@@ -106,6 +106,8 @@ function describeAction(a: TraceEntry["action"]): string {
       return `click element ${a.id}`;
     case "type":
       return `type "${oneLine(a.text, 60)}" into element ${a.id}${a.submit ? " + submit" : ""}`;
+    case "search":
+      return `search "${oneLine(a.query, 80)}"`;
     case "scroll":
       return a.id !== undefined
         ? `scroll element ${a.id} into view`
