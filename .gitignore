@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-electron/
+out/
+*.log
+.DS_Store
+.vite/
+
+# Secrets — never commit. Only .env.example (no real keys) is tracked.
+.env
+.env.*
+!.env.example

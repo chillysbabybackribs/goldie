@@ -1,0 +1,313 @@
+import type { WebContents } from "electron";
+import { type AXNode, type RawAXSnapshot, roleOf, nameOf } from "@goldie/agent-core";
+
+export type { RawAXSnapshot };
+
+// Roles that are pure structure/scaffolding — present in the tree but not
+// "content" a user would perceive. Kept in sync with perception/strip's intent.
+const STRUCTURAL_ROLES = new Set([
+  "RootWebArea",
+  "InlineTextBox",
+  "LineBreak",
+  "ListMarker",
+  "none",
+  "generic",
+  "LayoutTable",
+  "LayoutTableRow",
+  "LayoutTableCell",
+]);
+
+/**
+ * Count nodes a user would actually perceive — non-ignored, non-structural,
+ * and either interactable-by-role or carrying a name. Mirrors strip()'s notion
+ * of "kept" closely enough to gate navigation on real content being present.
+ */
+function countMeaningful(nodes: AXNode[]): number {
+  let n = 0;
+  for (const node of nodes) {
+    if (node.ignored) continue;
+    const role = roleOf(node);
+    if (STRUCTURAL_ROLES.has(role)) continue;
+    if (nameOf(node).length >= 2 || isInteractableRole(role)) n++;
+  }
+  return n;
+}
+
+function isInteractableRole(role: string): boolean {
+  return (
+    role === "link" ||
+    role === "button" ||
+    role === "textbox" ||
+    role === "searchbox" ||
+    role === "combobox" ||
+    role === "checkbox" ||
+    role === "radio" ||
+    role === "tab" ||
+    role === "menuitem"
+  );
+}
+
+/**
+ * A thin wrapper over Electron's built-in CDP (webContents.debugger). This is
+ * the seed of the future `ElectronCdpDriver` that will implement the abstract
+ * BrowserDriver interface in agent-core. For now it proves the three things
+ * Step 3 needs: a live debugger session, an a11y snapshot, and a deterministic
+ * click resolved through a CDP backend node.
+ *
+ * Design notes:
+ * - We attach once and keep the session for the life of the WebContents.
+ * - Domains (DOM, Accessibility, Runtime, Page) are enabled idempotently; a
+ *   cross-origin navigation tears down execution contexts, so re-enabling
+ *   before each high-level op is cheap insurance against "context destroyed".
+ * - All page geometry from CDP (getContentQuads) and all input coordinates
+ *   (dispatchMouseEvent) live in the SAME page-viewport CSS-pixel space, so a
+ *   click never needs to know where the slot is on screen. Self-consistent.
+ */
+
+
+export class CdpSession {
+  private wc: WebContents;
+  private attached = false;
+
+  constructor(wc: WebContents) {
+    this.wc = wc;
+  }
+
+  /** Attach the debugger. Safe to call repeatedly. */
+  attach(): void {
+    if (this.attached) return;
+    const dbg = this.wc.debugger;
+    if (!dbg.isAttached()) {
+      // '1.3' is the stable CDP version Chromium ships.
+      dbg.attach("1.3");
+    }
+    this.attached = true;
+    // If the page process goes away, drop our flag so a later op re-attaches.
+    dbg.on("detach", () => {
+      this.attached = false;
+    });
+  }
+
+  private async send<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<T> {
+    this.attach();
+    return (await this.wc.debugger.sendCommand(method, params)) as T;
+  }
+
+  /** Idempotently enable the domains our operations rely on. */
+  private async enableDomains(): Promise<void> {
+    await this.send("DOM.enable");
+    await this.send("Accessibility.enable");
+    await this.send("Runtime.enable");
+    await this.send("Page.enable");
+  }
+
+  /**
+   * Raw accessibility-tree snapshot. No stripping/organizing — that is Step 4.
+   * Each interactable node carries a backendDOMNodeId we can act on later.
+   */
+  async snapshotAccessibility(): Promise<RawAXSnapshot> {
+    await this.enableDomains();
+    const { nodes } = await this.send<{ nodes: AXNode[] }>(
+      "Accessibility.getFullAXTree",
+    );
+    return { url: this.wc.getURL(), nodes };
+  }
+
+  /**
+   * Cheap "does this page have real content yet?" probe. Many sites (Google,
+   * any SPA) fire did-finish-load with an empty/skeleton DOM and paint the real
+   * content milliseconds later via JS. A fixed settle either over-waits or
+   * snapshots a blank page. So instead we poll the AX tree until it has more
+   * than a handful of non-ignored, meaningful nodes — then we know perception
+   * will see SOMETHING. Capped by `timeoutMs` so a genuinely sparse page (or a
+   * hung one) can't stall the agent.
+   *
+   * "Meaningful" = non-ignored nodes that aren't pure structure and either are
+   * interactable or carry a name. This mirrors what `strip` keeps, so the gate
+   * agrees with what the planner will actually be shown.
+   */
+  async waitForContent(timeoutMs = 6000, minNodes = 3): Promise<void> {
+    await this.enableDomains();
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let meaningful = 0;
+      try {
+        const { nodes } = await this.send<{ nodes: AXNode[] }>(
+          "Accessibility.getFullAXTree",
+        );
+        meaningful = countMeaningful(nodes);
+      } catch {
+        // Context torn down mid-navigation — treat as "not ready yet".
+        meaningful = 0;
+      }
+      if (meaningful >= minNodes) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+
+  /**
+   * Deterministically click an element by its CDP backend node id.
+   * Resolves the element's on-page geometry, scrolls it into view, computes the
+   * center of its first content quad, and dispatches a real mouse press+release
+   * at that point — exactly what a user click does, no synthetic DOM events.
+   */
+  async clickBackendNode(backendNodeId: number): Promise<{
+    clicked: boolean;
+    x: number;
+    y: number;
+  }> {
+    await this.enableDomains();
+
+    // Make sure the element is on-screen before we read its box.
+    await this.send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+
+    const { quads } = await this.send<{ quads: number[][] }>(
+      "DOM.getContentQuads",
+      { backendNodeId },
+    );
+    if (!quads || quads.length === 0) {
+      return { clicked: false, x: 0, y: 0 };
+    }
+
+    // A quad is [x1,y1, x2,y2, x3,y3, x4,y4] — average to the centroid.
+    const q = quads[0];
+    const x = (q[0] + q[2] + q[4] + q[6]) / 4;
+    const y = (q[1] + q[3] + q[5] + q[7]) / 4;
+
+    // Move, then press+release — mirrors a genuine pointer interaction.
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+    });
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      buttons: 1,
+      clickCount: 1,
+    });
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      buttons: 0,
+      clickCount: 1,
+    });
+
+    return { clicked: true, x, y };
+  }
+
+  /**
+   * Type text into an element by backend node id: focus it (via DOM.focus,
+   * falling back to a click), select-all + delete to clear, then insert the
+   * text as real input. Mirrors a user typing into a field.
+   */
+  async typeIntoBackendNode(backendNodeId: number, text: string): Promise<void> {
+    await this.enableDomains();
+    try {
+      await this.send("DOM.focus", { backendNodeId });
+    } catch {
+      // Some elements can't be focused directly — click to focus instead.
+      await this.clickBackendNode(backendNodeId);
+    }
+    // Clear any existing value: Ctrl/Cmd+A then Backspace.
+    await this.selectAll();
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    // Insert the text as a single committed input.
+    await this.send("Input.insertText", { text });
+  }
+
+  /** Press Enter (e.g. to submit a search). Focus the node first. */
+  async pressEnterOnBackendNode(backendNodeId: number): Promise<void> {
+    await this.enableDomains();
+    try {
+      await this.send("DOM.focus", { backendNodeId });
+    } catch {
+      // best-effort — the field is usually already focused after typing.
+    }
+    const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 };
+    await this.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter });
+    await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...enter });
+  }
+
+  /**
+   * Scroll the viewport one near-full page in a direction by dispatching a real
+   * mouse-wheel event at the page center. Mirrors a user scrolling — works on
+   * any scroll container the pointer is over, no element targeting needed.
+   */
+  async scrollViewport(direction: "down" | "up"): Promise<void> {
+    await this.enableDomains();
+    const { width, height } = await this.viewportSize();
+    const deltaY = (direction === "up" ? -1 : 1) * Math.round(height * 0.85);
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x: Math.round(width / 2),
+      y: Math.round(height / 2),
+      deltaX: 0,
+      deltaY,
+    });
+    // A short settle so lazy/virtualized content can render before we snapshot.
+    await new Promise((r) => setTimeout(r, 350));
+  }
+
+  /** Scroll a specific element into view by backend node id. */
+  async scrollNodeIntoView(backendNodeId: number): Promise<void> {
+    await this.enableDomains();
+    await this.send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+    await new Promise((r) => setTimeout(r, 350));
+  }
+
+  /** Current layout viewport size in CSS px (for wheel coordinates). */
+  private async viewportSize(): Promise<{ width: number; height: number }> {
+    const { cssLayoutViewport } = await this.send<{
+      cssLayoutViewport: { clientWidth: number; clientHeight: number };
+    }>("Page.getLayoutMetrics");
+    return {
+      width: cssLayoutViewport?.clientWidth || 1024,
+      height: cssLayoutViewport?.clientHeight || 768,
+    };
+  }
+
+  private async selectAll(): Promise<void> {
+    const mod = process.platform === "darwin" ? 4 : 2; // Meta vs Ctrl bit
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "a",
+      windowsVirtualKeyCode: 65,
+      modifiers: mod,
+    });
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "a",
+      windowsVirtualKeyCode: 65,
+      modifiers: mod,
+    });
+  }
+
+  detach(): void {
+    if (this.wc.debugger.isAttached()) {
+      try {
+        this.wc.debugger.detach();
+      } catch {
+        // Already gone — fine.
+      }
+    }
+    this.attached = false;
+  }
+}

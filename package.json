@@ -1,0 +1,22 @@
+{
+  "name": "goldie",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Antigravity-style chat with a retractable, agent-driven embedded browser",
+  "scripts": {
+    "dev": "pnpm --filter @goldie/desktop dev",
+    "build": "pnpm --filter @goldie/desktop build",
+    "test": "pnpm --filter @goldie/agent-core test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  },
+  "packageManager": "pnpm@10.30.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["electron", "esbuild"]
+  }
+}
