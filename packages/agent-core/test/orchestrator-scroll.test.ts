@@ -58,6 +58,9 @@ class RecordingDriver implements BrowserDriver {
   async pressEnter(id: number) {
     this.calls.push(`pressEnter:${id}`);
   }
+  async pageIndex() {
+    return { url: "https://example.com", title: "", components: [], clusters: [] };
+  }
   async search(query: string) {
     this.calls.push(`search:${query}`);
     return true;

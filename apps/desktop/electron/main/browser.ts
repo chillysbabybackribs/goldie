@@ -101,6 +101,16 @@ export class BrowserManager {
     wc.on("did-navigate-in-page", emit);
     wc.on("page-title-updated", emit);
 
+    // Paint the actionable-index overlay on every fresh page load, and clear it
+    // the moment a new navigation starts (so it's tied to the current URL).
+    wc.on("did-start-navigation", () => {
+      void this.cdp?.clearIndexOverlay();
+    });
+    wc.on("did-finish-load", () => {
+      // Small settle so client-rendered content exists before we index it.
+      setTimeout(() => void this.refreshIndexOverlay(), 600);
+    });
+
     this.cdp = new CdpSession(wc);
     this.view = view;
     return view;
@@ -125,6 +135,32 @@ export class BrowserManager {
       cdp.captureText(),
     ]);
     return { ...ax, text };
+  }
+
+  /** The actionable index (clickable components + content clusters). */
+  async pageIndex() {
+    return this.cdpSession().buildPageIndex();
+  }
+
+  /**
+   * Build the index (which tags elements) and paint the persistent overlay over
+   * them. Called after a page settles so the human sees the actionable map.
+   * Best-effort and non-throwing — purely visual right now.
+   */
+  async refreshIndexOverlay(): Promise<void> {
+    try {
+      const idx = await this.cdpSession().buildPageIndex();
+      // TEMP verification log: what did clustering actually produce?
+      console.log(
+        `[index] ${idx.url} — ${idx.components.length} components, ${idx.clusters.length} clusters:`,
+      );
+      for (const s of idx.clusters) {
+        console.log(`  [${s.tag}] ${s.kind} "${s.label}" (${s.text.length} chars)`);
+      }
+      await this.cdpSession().drawIndexOverlay();
+    } catch {
+      // visual only
+    }
   }
 
   /**

@@ -6,6 +6,7 @@ import type { PageView } from "./types";
 
 export * from "./types";
 export * from "./ax-types";
+export * from "./page-index";
 export { strip } from "./strip";
 export { organize } from "./organize";
 export { summarize } from "./summarize";

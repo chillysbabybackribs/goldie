@@ -1,4 +1,5 @@
 import type { RawAXSnapshot } from "../perception/ax-types";
+import type { PageIndex } from "../perception/page-index";
 
 /**
  * The abstraction that keeps agent-core independent of Electron. The concrete
@@ -17,6 +18,12 @@ export interface BrowserDriver {
   navigate(url: string): Promise<void>;
   /** Raw accessibility snapshot — the perception pipeline's only input. */
   snapshot(): Promise<RawAXSnapshot>;
+  /**
+   * The actionable index: clickable components + extractable content clusters,
+   * built deterministically from the live DOM. This is the map the planner
+   * picks tags from and the overlay visualizes.
+   */
+  pageIndex(): Promise<PageIndex>;
   /** Deterministically click an element by its CDP backend node id. */
   click(backendNodeId: number): Promise<void>;
   /** Type text into an element by backend node id (focus + insert). */

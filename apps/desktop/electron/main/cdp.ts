@@ -1,5 +1,11 @@
 import type { WebContents } from "electron";
-import { type AXNode, type RawAXSnapshot, roleOf, nameOf } from "@goldie/agent-core";
+import {
+  type AXNode,
+  type RawAXSnapshot,
+  type PageIndex,
+  roleOf,
+  nameOf,
+} from "@goldie/agent-core";
 
 export type { RawAXSnapshot };
 
@@ -226,6 +232,8 @@ export class CdpSession {
         }
         if (node.nodeType !== Node.ELEMENT_NODE) return;
         if (SKIP.has(node.tagName)) return;
+        // Never let our own overlay leak into perception.
+        if (node.id === 'goldie-overlay-root') return;
         // Skip hidden subtrees (display:none / visibility:hidden / 0-size).
         const st = node.ownerDocument.defaultView.getComputedStyle(node);
         if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return;
@@ -245,6 +253,117 @@ export class CdpSession {
     } catch {
       return "";
     }
+  }
+
+  /**
+   * Build the ACTIONABLE INDEX from the live DOM: clickable components +
+   * extractable content clusters, each tagged + located. Deterministic and
+   * agnostic — heuristics over DOM structure, no per-site rules. The in-page
+   * pass marks each chosen element with data-goldie-tag and returns structured
+   * data; we then resolve each tag to a CDP backend node id in one bulk pass so
+   * the agent can act on a tag without the LLM ever seeing a selector.
+   */
+  async buildPageIndex(): Promise<PageIndex> {
+    await this.enableDomains();
+    const expr = buildIndexExpression();
+    let raw: RawIndex;
+    try {
+      const res = await this.send<{ result: { value?: RawIndex } }>(
+        "Runtime.evaluate",
+        { expression: expr, returnByValue: true },
+      );
+      raw = res.result?.value ?? emptyRawIndex();
+    } catch {
+      raw = emptyRawIndex();
+    }
+
+    // Resolve each tagged element → backend node id in one bulk DOM pass.
+    const tagToBackend = await this.resolveTaggedBackendIds();
+
+    const components = raw.components.map((c) => ({
+      tag: c.tag,
+      kind: c.kind,
+      name: c.name,
+      detail: c.detail || undefined,
+      rect: c.rect,
+      backendNodeId: tagToBackend.get(c.tag) ?? -1,
+    }));
+    const clusters = raw.clusters.map((s) => ({
+      tag: s.tag,
+      kind: s.kind,
+      label: s.label,
+      rect: s.rect,
+      text: s.text,
+      backendNodeId: tagToBackend.get(s.tag) ?? -1,
+    }));
+
+    return { url: this.wc.getURL(), title: raw.title, components, clusters };
+  }
+
+  /**
+   * Draw the PERSISTENT index overlay: a pass-through (pointer-events:none)
+   * layer of tagged boxes over each indexed component and cluster, so the human
+   * sees exactly what the deterministic pipeline perceives as actionable /
+   * extractable — and can still click the page underneath. Reads the
+   * data-goldie-tag attributes the index pass already set. Idempotent: replaces
+   * any previous overlay. The container (#goldie-overlay-root) is excluded from
+   * perception so it never pollutes the index it visualizes.
+   */
+  async drawIndexOverlay(): Promise<void> {
+    await this.enableDomains();
+    try {
+      await this.send("Runtime.evaluate", {
+        expression: overlayExpression(),
+        returnByValue: true,
+      });
+    } catch {
+      // Overlay is cosmetic; never fail an action over it.
+    }
+  }
+
+  /** Remove the index overlay (e.g. on navigation, before re-indexing). */
+  async clearIndexOverlay(): Promise<void> {
+    try {
+      await this.send("Runtime.evaluate", {
+        expression:
+          "(()=>{const e=document.getElementById('goldie-overlay-root');if(e)e.remove();})()",
+        returnByValue: true,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Map every data-goldie-tag element to its CDP backend node id, in bulk. */
+  private async resolveTaggedBackendIds(): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    try {
+      const { root } = await this.send<{ root: { nodeId: number } }>(
+        "DOM.getDocument",
+        { depth: -1 },
+      );
+      const { nodeIds } = await this.send<{ nodeIds: number[] }>(
+        "DOM.querySelectorAll",
+        { nodeId: root.nodeId, selector: "[data-goldie-tag]" },
+      );
+      for (const nodeId of nodeIds) {
+        try {
+          const { node } = await this.send<{
+            node: { backendNodeId: number; attributes?: string[] };
+          }>("DOM.describeNode", { nodeId });
+          const attrs = node.attributes ?? [];
+          const i = attrs.indexOf("data-goldie-tag");
+          if (i >= 0 && i + 1 < attrs.length) {
+            out.set(attrs[i + 1], node.backendNodeId);
+          }
+        } catch {
+          // skip a node that vanished mid-pass
+        }
+      }
+    } catch {
+      // DOM not ready — empty map; tags resolve to -1.
+    }
+    return out;
   }
 
   /**
@@ -478,4 +597,236 @@ export class CdpSession {
     }
     this.attached = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Actionable-index builder (in-page JS + raw shapes)
+// ---------------------------------------------------------------------------
+
+interface RawRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+interface RawComponent {
+  tag: string;
+  kind: string;
+  name: string;
+  detail: string;
+  rect: RawRect;
+}
+interface RawCluster {
+  tag: string;
+  kind: string;
+  label: string;
+  text: string;
+  rect: RawRect;
+}
+interface RawIndex {
+  title: string;
+  components: RawComponent[];
+  clusters: RawCluster[];
+}
+
+function emptyRawIndex(): RawIndex {
+  return { title: "", components: [], clusters: [] };
+}
+
+/**
+ * The in-page pass that builds the actionable index. Runs entirely in the
+ * page's JS context (via Runtime.evaluate). It:
+ *  - clears any previous goldie tags,
+ *  - finds visible clickable COMPONENTS (links/buttons/inputs/tabs), tags each
+ *    data-goldie-tag="cN", returns {tag,kind,name,detail,rect},
+ *  - detects extractable CLUSTERS agnostically (tables, repeated-sibling lists,
+ *    heading-delimited blocks), tags each "sN", returns {tag,kind,label,text,rect}.
+ * Everything is bounded so a huge page can't blow up the payload.
+ *
+ * Kept as a single self-contained IIFE string — no external deps, no per-site
+ * rules. This is the make-or-break cluster heuristic; tuned to be useful, not
+ * exhaustive.
+ */
+function buildIndexExpression(): string {
+  return `(() => {
+    const MAX_COMPONENTS = 120;
+    const MAX_CLUSTERS = 24;
+    const CLUSTER_TEXT_CAP = 1200;
+
+    // Clean previous run's tags so re-indexing is idempotent.
+    for (const el of document.querySelectorAll('[data-goldie-tag]')) {
+      el.removeAttribute('data-goldie-tag');
+    }
+
+    const visible = (el) => {
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 1 && r.height > 1;
+    };
+    const rectOf = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+    };
+    const text = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+    const cap = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+    // ---- COMPONENTS ----
+    const compSel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=checkbox], [role=menuitem], [contenteditable=true]';
+    const components = [];
+    let cN = 0;
+    for (const el of document.querySelectorAll(compSel)) {
+      if (cN >= MAX_COMPONENTS) break;
+      if (!visible(el)) continue;
+      const tagName = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || '';
+      let kind = 'button';
+      if (tagName === 'a' || role === 'link') kind = 'link';
+      else if (tagName === 'input' || tagName === 'textarea' || el.getAttribute('contenteditable') === 'true') kind = 'input';
+      else if (tagName === 'select') kind = 'select';
+      else if (role === 'tab') kind = 'tab';
+      else if (role === 'checkbox' || el.type === 'checkbox') kind = 'checkbox';
+      const name = cap(text(el) || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || '', 80);
+      let detail = '';
+      if (kind === 'link' && el.href) { try { const u = new URL(el.href); detail = (u.host + u.pathname).slice(0, 48); } catch {} }
+      else if (kind === 'input') detail = (el.value || el.placeholder || '').slice(0, 40);
+      const tag = 'c' + (++cN);
+      el.setAttribute('data-goldie-tag', tag);
+      components.push({ tag, kind, name, detail, rect: rectOf(el) });
+    }
+
+    // ---- CLUSTERS ----
+    const clusters = [];
+    let sN = 0;
+    const used = new Set();
+    const labelFor = (el) => {
+      // nearest preceding heading, or aria-label, or caption
+      const cap2 = el.querySelector && el.querySelector('caption');
+      if (cap2 && text(cap2)) return cap(text(cap2), 60);
+      const aria = el.getAttribute && el.getAttribute('aria-label');
+      if (aria) return cap(aria, 60);
+      let h = el.previousElementSibling;
+      let hops = 0;
+      while (h && hops < 4) {
+        if (/^H[1-6]$/.test(h.tagName) && text(h)) return cap(text(h), 60);
+        h = h.previousElementSibling; hops++;
+      }
+      // a heading inside the cluster
+      const inner = el.querySelector && el.querySelector('h1,h2,h3,h4,h5,h6');
+      if (inner && text(inner)) return cap(text(inner), 60);
+      return '';
+    };
+    // Density check: reject "blob wrappers" whose text is ~entirely inside ONE
+    // descendant (that descendant is the real cluster, not this wrapper).
+    const isBlobWrapper = (el, t) => {
+      let biggest = 0;
+      for (const c of el.children) {
+        const ct = text(c).length;
+        if (ct > biggest) biggest = ct;
+      }
+      return t.length > 0 && biggest / t.length >= 0.9 && el.children.length <= 2;
+    };
+
+    const addCluster = (el, kind, opts) => {
+      opts = opts || {};
+      if (sN >= MAX_CLUSTERS) return false;
+      if (used.has(el) || !visible(el)) return false;
+      const t = text(el);
+      if (t.length < 40) return false; // too small to be worth extracting
+      // skip if an ancestor OR descendant is already a cluster (no nesting dup)
+      let p = el.parentElement;
+      while (p) { if (used.has(p)) return false; p = p.parentElement; }
+      if (el.querySelector && el.querySelector('[data-goldie-tag^=s]')) return false;
+      const label = labelFor(el);
+      // Quality gate: must have a real label, UNLESS it's a dense data structure
+      // (a table with header cells, or a strong repeated-row list).
+      if (!label && !opts.allowUnlabeled) return false;
+      if (isBlobWrapper(el, t)) return false;
+      used.add(el);
+      const tag = 's' + (++sN);
+      el.setAttribute('data-goldie-tag', tag);
+      clusters.push({ tag, kind, label: label || kind, text: cap(t, CLUSTER_TEXT_CAP), rect: rectOf(el) });
+      return true;
+    };
+
+    // 1) DATA tables only — must have header cells or a caption/label. Layout
+    //    tables (no th, no caption, no heading) are skipped as noise.
+    for (const el of document.querySelectorAll('table, [role=table], [role=grid]')) {
+      if (sN >= MAX_CLUSTERS) break;
+      const hasHeaders = el.querySelector && (el.querySelector('th, thead, [role=columnheader]') || el.querySelector('caption'));
+      addCluster(el, 'table', { allowUnlabeled: !!hasHeaders });
+    }
+
+    // 2) Repeated-sibling groups (lists): a parent with >=3 similar children.
+    //    Strong repetition is allowed even without a label (it's clearly a list).
+    const sig = (el) => el.tagName + '.' + (el.className && typeof el.className === 'string' ? el.className.split(/\\s+/)[0] : '');
+    const containers = document.querySelectorAll('ul, ol, [role=list], section');
+    for (const parent of containers) {
+      if (sN >= MAX_CLUSTERS) break;
+      if (used.has(parent)) continue;
+      const kids = Array.from(parent.children).filter((k) => k.getBoundingClientRect().height > 4);
+      if (kids.length < 3) continue;
+      const sigs = {};
+      for (const k of kids) { const s = sig(k); sigs[s] = (sigs[s] || 0) + 1; }
+      const top = Math.max(0, ...Object.values(sigs));
+      if (top >= 3 && top >= kids.length * 0.6) addCluster(parent, 'list', { allowUnlabeled: true });
+    }
+
+    // 3) Heading-delimited blocks — only for tighter wrappers (section/article),
+    //    not page-spanning main/div, and only when labeled by their heading.
+    for (const h of document.querySelectorAll('h2, h3')) {
+      if (sN >= MAX_CLUSTERS) break;
+      const parent = h.parentElement;
+      if (!parent || used.has(parent)) continue;
+      if (/^(SECTION|ARTICLE)$/.test(parent.tagName)) {
+        const t = text(parent);
+        if (t.length > 80 && t.length < 4000) addCluster(parent, 'section');
+      }
+    }
+
+    const title = (document.title || '').trim();
+    return { title, components, clusters };
+  })()`;
+}
+
+/**
+ * In-page JS that paints the persistent index overlay. Reads the
+ * data-goldie-tag attributes set by the index pass and draws one labeled,
+ * pass-through box per tag — components (cN) ringed in indigo, clusters (sN) in
+ * amber. The whole layer is pointer-events:none so the page stays fully usable.
+ * Re-running replaces the prior overlay.
+ */
+function overlayExpression(): string {
+  return `(() => {
+    const ID = 'goldie-overlay-root';
+    const old = document.getElementById(ID);
+    if (old) old.remove();
+    const root = document.createElement('div');
+    root.id = ID;
+    root.setAttribute('data-goldie-tag', ''); // mark so index never re-tags it
+    root.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483646;';
+    const tagged = document.querySelectorAll('[data-goldie-tag]:not(#' + ID + ')');
+    for (const el of tagged) {
+      const tag = el.getAttribute('data-goldie-tag');
+      if (!tag) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      const isCluster = tag[0] === 's';
+      const color = isCluster ? '251,191,36' : '129,140,248';
+      const box = document.createElement('div');
+      box.style.cssText =
+        'position:fixed;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;' +
+        'border:1.5px solid rgba(' + color + ',0.9);border-radius:4px;box-sizing:border-box;' +
+        'background:rgba(' + color + ',0.07);pointer-events:none;';
+      const lbl = document.createElement('div');
+      lbl.textContent = tag;
+      lbl.style.cssText =
+        'position:absolute;top:-1px;left:-1px;font:600 10px/1.4 ui-monospace,monospace;' +
+        'padding:0 4px;color:#0b0d10;background:rgba(' + color + ',0.95);border-radius:3px 0 4px 0;';
+      box.appendChild(lbl);
+      root.appendChild(box);
+    }
+    document.documentElement.appendChild(root);
+    return tagged.length;
+  })()`;
 }

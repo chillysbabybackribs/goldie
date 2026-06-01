@@ -25,6 +25,10 @@ export class ElectronCdpDriver implements BrowserDriver {
     return this.browser.snapshot();
   }
 
+  async pageIndex() {
+    return this.browser.pageIndex();
+  }
+
   async click(backendNodeId: number): Promise<void> {
     const r = await this.browser.clickNode(backendNodeId);
     if (!r.clicked) {
