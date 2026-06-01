@@ -79,7 +79,25 @@ describe("orchestrator scroll action", () => {
     expect(driver.calls).toContain("scroll:down");
     expect(result.answer).toBe("done");
     const scrollStep = result.steps.find((s) => s.action.type === "scroll");
-    expect(scrollStep?.outcome).toBe("scrolled down");
+    // A single viewport scroll still happens; the outcome now also reminds the
+    // planner the full text is already shown (scroll-loop prevention).
+    expect(scrollStep?.outcome).toMatch(/^scrolled down/);
+  });
+
+  it("hard-stops a viewport scroll-loop after a couple in a row", async () => {
+    const driver = new RecordingDriver();
+    const planner = new ScriptedPlanner([
+      { type: "navigate", url: "https://example.com" },
+      { type: "scroll", direction: "down" },
+      { type: "scroll", direction: "down" },
+      { type: "scroll", direction: "down" }, // 3rd consecutive — refused
+      { type: "finish", answer: "ok" },
+    ]);
+    const result = await new Orchestrator(planner, driver).run("stop looping");
+    // Only the first two scrolls reach the driver; the third is refused.
+    expect(driver.calls.filter((c) => c === "scroll:down").length).toBe(2);
+    const last = result.steps[result.steps.length - 1];
+    expect(last.outcome).toMatch(/scrolling does not reveal new text/i);
   });
 
   it("defaults scroll direction to down when omitted", async () => {

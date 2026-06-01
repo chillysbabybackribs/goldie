@@ -112,9 +112,19 @@ export class BrowserManager {
     return this.cdp!;
   }
 
-  /** Raw a11y snapshot of the live page (perception's input). */
+  /**
+   * Perception's input: the a11y snapshot PLUS the page's visible rendered text
+   * (the content the a11y tree drops). Captured together so the planner sees a
+   * page's data — tables, labeled numbers — in one snapshot instead of scrolling
+   * to hunt for content the a11y tree can't surface.
+   */
   async snapshot(): Promise<RawAXSnapshot> {
-    return this.cdpSession().snapshotAccessibility();
+    const cdp = this.cdpSession();
+    const [ax, text] = await Promise.all([
+      cdp.snapshotAccessibility(),
+      cdp.captureText(),
+    ]);
+    return { ...ax, text };
   }
 
   /** Deterministic click by CDP backend node id. */

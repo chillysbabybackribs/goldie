@@ -1,6 +1,7 @@
 import type { BrowserDriver } from "../driver/browser-driver";
 import { perceive } from "../perception";
 import type { PageView } from "../perception/types";
+import { buildPlanMessage } from "../planner/prompt";
 import type {
   Action,
   AgentEvent,
@@ -10,6 +11,7 @@ import type {
   RunResult,
   StepRecord,
   TokenUsage,
+  TraceEntry,
 } from "./types";
 
 const DEFAULT_MAX_STEPS = 12;
@@ -63,10 +65,17 @@ export class Orchestrator {
     };
     let browsed = false;
     let page: PageView | null = null;
+    // Consecutive viewport-scroll counter, for the scroll-loop hard stop.
+    const scrollState = { consecutive: 0 };
 
     // Inject the session context only on the planner's FIRST turn — it's prior
     // context, not per-step state, so we don't re-send it every turn.
     let firstTurn = true;
+    // The trace entry for the turn currently being planned (completed with its
+    // outcome after the action runs). Held in a holder so TS keeps its type
+    // across the closure assignment (a bare closure-mutated `let` narrows to
+    // never at the use site). Only populated when options.trace is set.
+    const pending: { trace: TraceEntry | null } = { trace: null };
     const plan = async (input: PlanInput): Promise<Action> => {
       emit({ type: "thinking" });
       const seeded: PlanInput = firstTurn
@@ -86,6 +95,22 @@ export class Orchestrator {
           (usage.cacheWrite ?? 0) + (result.usage.cacheWrite ?? 0);
         usage.calls += 1;
         emit({ type: "usage", usage: { ...usage } });
+      }
+      // Capture EXACTLY what was sent and decided. Held until the action's
+      // outcome is known, then emitted (or emitted as-is for finish/answer).
+      if (options.trace) {
+        pending.trace = {
+          step: input.step,
+          sentMessage: buildPlanMessage(seeded),
+          action: result.action,
+          turnUsage: result.usage
+            ? {
+                input: result.usage.input,
+                output: result.usage.output,
+                cacheRead: result.usage.cacheRead,
+              }
+            : undefined,
+        };
       }
       return result.action;
     };
@@ -118,6 +143,7 @@ export class Orchestrator {
 
       // ACT
       if (action.type === "answer" || action.type === "finish") {
+        if (options.trace && pending.trace) options.trace(pending.trace);
         emit({ type: "answer", text: action.answer });
         return { answer: action.answer, steps: history, browsed, usage };
       }
@@ -128,8 +154,12 @@ export class Orchestrator {
         emit({ type: "browsing-started" });
       }
 
-      const outcome = await this.act(action, page);
+      const outcome = await this.act(action, page, scrollState);
       history.push({ action, outcome });
+      if (options.trace && pending.trace) {
+        pending.trace.outcome = outcome;
+        options.trace(pending.trace);
+      }
       emit({ type: "observation", outcome });
     }
 
@@ -141,6 +171,7 @@ export class Orchestrator {
       step: maxSteps,
       maxSteps,
     });
+    if (options.trace && pending.trace) options.trace(pending.trace);
     const answer =
       wrapUp.type === "answer" || wrapUp.type === "finish"
         ? wrapUp.answer
@@ -159,8 +190,21 @@ export class Orchestrator {
    * Execute one Action deterministically. Resolves an element id through the
    * CURRENT page's byId map only. On a stale-node error, re-snapshots and
    * retries once against the fresh map before giving up.
+   *
+   * `scrollState` tracks consecutive viewport scrolls so we can hard-stop a
+   * scroll-loop: the full page text is already captured each snapshot, so
+   * repeatedly scrolling to "read more" is pure waste. After a couple, we tell
+   * the planner plainly that scrolling won't reveal new text.
    */
-  private async act(action: Action, page: PageView | null): Promise<string> {
+  private async act(
+    action: Action,
+    page: PageView | null,
+    scrollState: { consecutive: number },
+  ): Promise<string> {
+    if (action.type !== "scroll" || action.id !== undefined) {
+      // Any non-viewport-scroll action breaks the run.
+      scrollState.consecutive = 0;
+    }
     switch (action.type) {
       case "navigate": {
         // Hard guard against redundant navigation: if we're already on this
@@ -193,10 +237,16 @@ export class Orchestrator {
             return `scrolled element ${action.id} into view`;
           });
         }
-        // Viewport scroll: no element needed, just move the page.
+        // Viewport scroll: the full page text is ALREADY in every snapshot, so
+        // scrolling to read is wasted. After 2 in a row, refuse and redirect the
+        // planner to the content it already has.
+        scrollState.consecutive++;
+        if (scrollState.consecutive > 2) {
+          return "scrolling does not reveal new text — the READABLE CONTENT block already has the whole page. Use what's shown to answer/act, or navigate elsewhere.";
+        }
         const direction = action.direction ?? "down";
         await this.driver.scroll(direction);
-        return `scrolled ${direction}`;
+        return `scrolled ${direction} (note: the full page text is already shown each turn; scroll only to reach an element, not to read)`;
       }
 
       default:

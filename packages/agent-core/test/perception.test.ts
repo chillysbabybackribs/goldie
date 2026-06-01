@@ -216,6 +216,70 @@ describe("summarize / perceive", () => {
     expect(perceive(hn).summary).not.toMatch(/no readable content/i);
   });
 
+  it("weaves in visible page text the a11y tree missed (e.g. data values)", () => {
+    // Simulate a data-heavy page (like Nasdaq) where the a11y tree is sparse but
+    // the rendered text holds the numbers the task needs.
+    const snap: RawAXSnapshot = {
+      url: "https://www.nasdaq.com/market-activity/stocks/nbis",
+      text: "Key Data\nP/E Ratio 239.20\nMarket Cap 66.8B\nEPS -2.10\n52 Week High 274.80",
+      nodes: [
+        {
+          nodeId: "1",
+          childIds: ["2"],
+          ignored: false,
+          role: { type: "role", value: "RootWebArea" },
+          name: { type: "string", value: "NBIS Stock Quote" },
+          backendDOMNodeId: 1,
+        },
+        {
+          nodeId: "2",
+          parentId: "1",
+          ignored: false,
+          role: { type: "role", value: "link" },
+          name: { type: "string", value: "Edit my quotes" },
+          backendDOMNodeId: 2,
+        },
+      ],
+    };
+    const view = perceive(snap);
+    expect(view.summary).toMatch(/READABLE CONTENT/);
+    // The data the a11y tree dropped now reaches the planner.
+    expect(view.summary).toContain("P/E Ratio 239.20");
+    expect(view.summary).toContain("Market Cap 66.8B");
+  });
+
+  it("does not duplicate outline names in the readable-content block", () => {
+    const snap: RawAXSnapshot = {
+      url: "https://example.com",
+      // "Edit my quotes" is already an element; it must NOT repeat in content.
+      text: "Edit my quotes\nUnique body sentence about the company.",
+      nodes: [
+        {
+          nodeId: "1",
+          childIds: ["2"],
+          ignored: false,
+          role: { type: "role", value: "RootWebArea" },
+          name: { type: "string", value: "Example" },
+          backendDOMNodeId: 1,
+        },
+        {
+          nodeId: "2",
+          parentId: "1",
+          ignored: false,
+          role: { type: "role", value: "link" },
+          name: { type: "string", value: "Edit my quotes" },
+          backendDOMNodeId: 2,
+        },
+      ],
+    };
+    const view = perceive(snap);
+    // The body sentence appears; the duplicated element name does not reappear
+    // inside the READABLE CONTENT block.
+    const contentBlock = view.summary.split("READABLE CONTENT")[1] ?? "";
+    expect(contentBlock).toContain("Unique body sentence");
+    expect(contentBlock).not.toContain("Edit my quotes");
+  });
+
   it("every id in the rendered summary exists in the resolution map", () => {
     const view = perceive(hn);
     const renderedIds = [...view.summary.matchAll(/\((\d+)\)/g)].map((m) =>

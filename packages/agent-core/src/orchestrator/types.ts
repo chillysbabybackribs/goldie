@@ -96,6 +96,25 @@ export interface RunOptions {
    * can choose to reuse it (per the "let the planner decide" design).
    */
   startWithCurrentPage?: boolean;
+  /**
+   * Optional per-turn tracer for instrumentation. Called once per planner turn
+   * with exactly what was sent and decided, so a host can write a human-readable
+   * run log. agent-core stays pure (no fs); the host owns persistence.
+   */
+  trace?: (entry: TraceEntry) => void;
+}
+
+/** One planner turn, captured for a human-readable run trace. */
+export interface TraceEntry {
+  step: number;
+  /** The fully-rendered user message sent to the LLM this turn. */
+  sentMessage: string;
+  /** The action the LLM returned. */
+  action: Action;
+  /** Token usage for THIS turn (not cumulative). */
+  turnUsage?: { input: number; output: number; cacheRead?: number };
+  /** The deterministic outcome of the action (filled after act). */
+  outcome?: string;
 }
 
 export interface RunResult {

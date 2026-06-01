@@ -7,6 +7,7 @@ import {
 } from "@goldie/agent-core";
 import { getApiKey } from "./config";
 import { ElectronCdpDriver } from "./cdp-driver";
+import { RunTracer } from "./run-trace";
 import type { BrowserManager } from "./browser";
 
 /** Map the renderer's model-picker label to a provider + concrete model. */
@@ -53,6 +54,7 @@ export class AgentRunner {
     this.session.setBrowserState(this.browser.currentUrl(), this.browser.title());
     const onPage = this.session.renderBrowserState().length > 0;
 
+    const tracer = new RunTracer();
     try {
       const planner = createPlanner(provider, apiKey, model);
       const driver = new ElectronCdpDriver(this.browser);
@@ -64,7 +66,11 @@ export class AgentRunner {
         browserState: this.session.renderBrowserState() || undefined,
         // Let the planner decide whether to reuse the open page.
         startWithCurrentPage: onPage,
+        trace: tracer.add,
       });
+
+      // Write the human-readable run trace for inspection.
+      tracer.write(task, result.answer);
 
       // One-line usage trace to the main-process console (dev visibility).
       const u = result.usage;

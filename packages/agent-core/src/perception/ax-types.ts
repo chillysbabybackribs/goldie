@@ -36,6 +36,14 @@ export interface AXNode {
 export interface RawAXSnapshot {
   url: string;
   nodes: AXNode[];
+  /**
+   * Optional VISIBLE rendered text of the page (document order), captured by the
+   * driver separately from the a11y tree. The a11y tree drops content that isn't
+   * exposed accessibly (data tables, custom widgets, labeled numbers); this is
+   * how that content reaches perception. Drivers that can't provide it omit it
+   * and the pipeline behaves exactly as before.
+   */
+  text?: string;
 }
 
 /** Convenience: read a string-ish property value off a node. */

@@ -117,6 +117,57 @@ export class CdpSession {
   }
 
   /**
+   * Capture the page's VISIBLE rendered text — the content the accessibility
+   * tree drops (data tables, custom widgets, labeled numbers like a stock's
+   * P/E). Runs in-page JS that walks the DOM, skips chrome/script/hidden nodes,
+   * and returns whitespace-collapsed text in document order. This is the "read
+   * what's actually on the page" half of perception that the a11y tree alone
+   * misses. Bounded so a huge page can't blow the budget; the pipeline trims
+   * further. Agnostic: no per-site selectors, just visibility + role-of-tag.
+   */
+  async captureText(maxChars = 12000): Promise<string> {
+    await this.enableDomains();
+    const js = `(() => {
+      const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','NAV','FOOTER','HEADER','IFRAME','TEMPLATE']);
+      const out = [];
+      let total = 0;
+      const cap = ${maxChars};
+      const seen = new Set();
+      const walk = (node) => {
+        if (total >= cap) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+          const t = node.textContent.replace(/\\s+/g, ' ').trim();
+          if (t.length >= 2 && !seen.has(t)) {
+            seen.add(t);
+            out.push(t);
+            total += t.length;
+          }
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (SKIP.has(node.tagName)) return;
+        // Skip hidden subtrees (display:none / visibility:hidden / 0-size).
+        const st = node.ownerDocument.defaultView.getComputedStyle(node);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return;
+        const r = node.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return;
+        for (const child of node.childNodes) walk(child);
+      };
+      walk(document.body);
+      return out.join('\\n');
+    })()`;
+    try {
+      const res = await this.send<{ result: { value?: string } }>(
+        "Runtime.evaluate",
+        { expression: js, returnByValue: true },
+      );
+      return res.result?.value ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Cheap "does this page have real content yet?" probe. Many sites (Google,
    * any SPA) fire did-finish-load with an empty/skeleton DOM and paint the real
    * content milliseconds later via JS. A fixed settle either over-waits or

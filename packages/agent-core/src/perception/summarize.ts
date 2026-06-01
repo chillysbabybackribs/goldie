@@ -29,11 +29,20 @@ export interface SummarizeOptions {
   maxPerRegion?: number;
   /** Hard cap on total rendered nodes across the page. */
   maxTotal?: number;
+  /**
+   * Visible rendered page text (from the driver) to weave in as a READABLE
+   * CONTENT block — the data the a11y outline misses. Deduped against the
+   * element names already shown so we don't repeat link labels.
+   */
+  pageText?: string;
+  /** Max characters of readable content to include (token budget guard). */
+  maxTextChars?: number;
 }
 
-const DEFAULTS: Required<SummarizeOptions> = {
+const DEFAULTS: Required<Omit<SummarizeOptions, "pageText">> = {
   maxPerRegion: 40,
   maxTotal: 200,
+  maxTextChars: 2400,
 };
 
 /** Hard per-region cap for chrome (nav/footer) so boilerplate collapses fast. */
@@ -152,12 +161,27 @@ export function summarize(
     lines.push(`… ${bits.join(", ")} not shown (snapshot to expand)`);
   }
 
+  // READABLE CONTENT — the visible page text the a11y outline misses (data
+  // values, table cells, paragraphs). Deduped against names already in the
+  // outline so we don't repeat link/heading labels, and bounded so it can't
+  // bloat the payload. This is what lets the planner SEE a stock's P/E or a
+  // table of metrics that the a11y tree dropped — and read a page in ONE
+  // snapshot instead of scrolling for it.
+  const contentText = options.pageText
+    ? renderReadableContent(options.pageText, page, opts.maxTextChars)
+    : "";
+  if (contentText) {
+    lines.push("");
+    lines.push("READABLE CONTENT (visible page text):");
+    lines.push(contentText);
+  }
+
   // Nothing meaningful rendered: this page is genuinely empty or still loading.
   // Say so explicitly so the planner doesn't fabricate "scroll to reveal hidden
   // content" loops — there is nothing below the fold to reveal. Scrolling a
   // blank page does nothing; the right move is to navigate somewhere with
   // content (or reconsider the chosen site).
-  if (total === 0) {
+  if (total === 0 && !contentText) {
     lines.push(
       "(This page has no readable content — it is blank or failed to load. " +
         "Scrolling will not reveal anything. Navigate to a page that has content.)",
@@ -171,6 +195,60 @@ export function summarize(
     byId: page.byId,
     elementCount,
   };
+}
+
+/**
+ * Turn captured page text into a compact readable block: drop lines that merely
+ * repeat an element already in the outline, drop trivially-short fragments,
+ * collapse runs, and cap to a char budget. Keeps document order (where the data
+ * actually is) and reports honest truncation.
+ */
+function renderReadableContent(
+  pageText: string,
+  page: PerceivedPage,
+  maxChars: number,
+): string {
+  // Names already visible in the outline — skip these in the content block.
+  const shown = new Set<string>();
+  for (const region of page.regions) {
+    for (const n of region.nodes) {
+      if (n.name) shown.add(normalize(n.name));
+    }
+  }
+  if (page.title) shown.add(normalize(page.title));
+
+  const seen = new Set<string>();
+  const kept: string[] = [];
+  let used = 0;
+  let dropped = 0;
+
+  for (const raw of pageText.split("\n")) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (line.length < 2) continue;
+    const key = normalize(line);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // Skip pure-boilerplate lines already represented as elements/headings.
+    if (shown.has(key)) continue;
+    if (used + line.length > maxChars) {
+      dropped++;
+      continue;
+    }
+    kept.push("  " + truncateLine(line, 200));
+    used += line.length;
+  }
+
+  if (kept.length === 0) return "";
+  if (dropped > 0) kept.push(`  … +${dropped} more line(s) of content (read to expand)`);
+  return kept.join("\n");
+}
+
+function normalize(s: string): string {
+  return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function truncateLine(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
 
 function renderRegion(
