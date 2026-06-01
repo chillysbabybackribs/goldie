@@ -4,6 +4,7 @@ import type { AgentEvent } from "@goldie/agent-core";
 import { getProviderStatus } from "./config";
 import { BrowserManager, type SlotBounds } from "./browser";
 import { AgentRunner } from "./agent";
+import { ExecutorRunner } from "./executor-runner";
 
 // The deep charcoal canvas — matches the renderer so there is no white flash
 // on launch and the window feels like one continuous surface.
@@ -12,6 +13,7 @@ const CANVAS = "#16181b";
 let mainWindow: BrowserWindow | null = null;
 let browser: BrowserManager | null = null;
 let agent: AgentRunner | null = null;
+let executor: ExecutorRunner | null = null;
 // In-flight chat runs, so the renderer can abort one by id.
 const runs = new Map<string, AbortController>();
 
@@ -73,6 +75,9 @@ function createWindow(): void {
 
   // The agent. Keys live in main (config) and never cross to the renderer.
   agent = new AgentRunner(browser);
+  // The plan→execute challenger. Triggered by an "/exec " message prefix so we
+  // can A/B it against the orchestrator without any UI change.
+  executor = new ExecutorRunner(browser);
 
   // A chat turn: run the agent, streaming events back tagged with the run id.
   // When browsing starts, auto-open the browser panel in the renderer.
@@ -88,8 +93,15 @@ function createWindow(): void {
         }
         mainWindow?.webContents.send("chat:event", { id, event });
       };
+      // "/exec <goal>" routes to the plan→execute path; anything else uses the
+      // working orchestrator. The prefix is stripped before running.
+      const execMatch = /^\/exec\s+(.+)/is.exec(task);
       try {
-        await agent?.run(task, model, send, controller.signal);
+        if (execMatch) {
+          await executor?.run(execMatch[1].trim(), send, controller.signal);
+        } else {
+          await agent?.run(task, model, send, controller.signal);
+        }
       } finally {
         runs.delete(id);
         mainWindow?.webContents.send("chat:event", {
