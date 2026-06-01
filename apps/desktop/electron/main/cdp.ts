@@ -48,6 +48,23 @@ function isInteractableRole(role: string): boolean {
 }
 
 /**
+ * Approximate area of a CDP content quad [x1,y1,x2,y2,x3,y3,x4,y4] via the
+ * shoelace formula. Used to reject degenerate (zero/near-zero) boxes before a
+ * click so we never dispatch at the centroid of a bogus rectangle.
+ */
+function quadArea(q: number[]): number {
+  if (!q || q.length < 8) return 0;
+  const x = [q[0], q[2], q[4], q[6]];
+  const y = [q[1], q[3], q[5], q[7]];
+  let a = 0;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    a += x[i] * y[j] - x[j] * y[i];
+  }
+  return Math.abs(a) / 2;
+}
+
+/**
  * Pick the page's best search box from the AX tree, agnostically. Scores each
  * candidate input: an explicit `searchbox` role wins; a `textbox`/`combobox`
  * whose name hints at search ranks next; any other text input is a last resort.
@@ -133,6 +150,38 @@ export class CdpSession {
     await this.send("Accessibility.enable");
     await this.send("Runtime.enable");
     await this.send("Page.enable");
+    // Overlay = the inspector's element-highlight layer. It draws ON TOP of the
+    // page (its own compositor layer), never in the DOM — so highlighting a
+    // target can't pollute the a11y snapshot or readable-text capture.
+    try {
+      await this.send("Overlay.enable");
+    } catch {
+      // Overlay is best-effort; a click never depends on it.
+    }
+  }
+
+  /**
+   * Draw the inspector-style box on a node for `ms`, then clear it. Pure visual
+   * feedback owned by the deterministic pipeline — shows exactly what it's about
+   * to act on. Best-effort: never blocks or fails an action.
+   */
+  private async highlightNode(backendNodeId: number, ms = 450): Promise<void> {
+    try {
+      await this.send("Overlay.highlightNode", {
+        backendNodeId,
+        highlightConfig: {
+          // Goldie's accent-ish translucent fill + a solid ring, like the
+          // DevTools inspector but tuned to read as "the agent is here".
+          contentColor: { r: 99, g: 102, b: 241, a: 0.18 },
+          borderColor: { r: 129, g: 140, b: 248, a: 0.9 },
+          showInfo: false,
+        },
+      });
+      await new Promise((r) => setTimeout(r, ms));
+      await this.send("Overlay.hideHighlight");
+    } catch {
+      // Best-effort overlay; ignore.
+    }
   }
 
   /**
@@ -253,9 +302,15 @@ export class CdpSession {
 
   /**
    * Deterministically click an element by its CDP backend node id.
-   * Resolves the element's on-page geometry, scrolls it into view, computes the
-   * center of its first content quad, and dispatches a real mouse press+release
-   * at that point — exactly what a user click does, no synthetic DOM events.
+   * Resolves the element's on-page geometry, scrolls it into view, draws the
+   * overlay highlight, GUARDS that the geometry is real (refuses to blind-click
+   * an element with no/degenerate box), then dispatches a real mouse
+   * press+release at the centroid — exactly what a user click does.
+   *
+   * The guard matters: getContentQuads can return an empty or zero-area box for
+   * an off-screen / display:contents / collapsed element. Clicking the centroid
+   * of a bogus box would land on whatever happens to be at (0,0)-ish — a
+   * mis-click. We refuse and report instead.
    */
   async clickBackendNode(backendNodeId: number): Promise<{
     clicked: boolean;
@@ -275,10 +330,19 @@ export class CdpSession {
       return { clicked: false, x: 0, y: 0 };
     }
 
+    // Pick the first quad with real area; reject degenerate boxes.
+    const q = quads.find((cand) => quadArea(cand) >= 4);
+    if (!q) {
+      return { clicked: false, x: 0, y: 0 };
+    }
+
     // A quad is [x1,y1, x2,y2, x3,y3, x4,y4] — average to the centroid.
-    const q = quads[0];
     const x = (q[0] + q[2] + q[4] + q[6]) / 4;
     const y = (q[1] + q[3] + q[5] + q[7]) / 4;
+
+    // Show the user exactly what we're about to click (what's shown == what's
+    // clicked: same resolved node, same geometry).
+    await this.highlightNode(backendNodeId);
 
     // Move, then press+release — mirrors a genuine pointer interaction.
     await this.send("Input.dispatchMouseEvent", {
@@ -313,6 +377,8 @@ export class CdpSession {
    */
   async typeIntoBackendNode(backendNodeId: number, text: string): Promise<void> {
     await this.enableDomains();
+    // Show the field we're about to type into.
+    await this.highlightNode(backendNodeId);
     try {
       await this.send("DOM.focus", { backendNodeId });
     } catch {
