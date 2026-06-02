@@ -128,6 +128,17 @@ export class BrowserManager {
   }
 
   /**
+   * Render a URL in the embedded browser (JS runs) and return its visible text.
+   * The research pipeline's fallback for JS-gated pages that raw HTTP can't read
+   * (e.g. Yahoo Finance). Returns plain text already, so callers can use it
+   * directly. Large cap since a research page can be dense.
+   */
+  async fetchRendered(url: string): Promise<string> {
+    await this.navigateAndWait(url);
+    return this.cdpSession().captureText(16000);
+  }
+
+  /**
    * Deterministic click that WAITS for any navigation it triggers. A click on a
    * link/tab/button often navigates or swaps the view; without this wait the
    * loop snapshots a blank/mid-load page and the planner has to notice and route

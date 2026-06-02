@@ -4,6 +4,7 @@ import type { AgentEvent } from "@goldie/agent-core";
 import { getProviderStatus } from "./config";
 import { BrowserManager, type SlotBounds } from "./browser";
 import { AgentRunner } from "./agent";
+import { ResearchRunner } from "./research-runner";
 
 // The deep charcoal canvas — matches the renderer so there is no white flash
 // on launch and the window feels like one continuous surface.
@@ -12,6 +13,7 @@ const CANVAS = "#16181b";
 let mainWindow: BrowserWindow | null = null;
 let browser: BrowserManager | null = null;
 let agent: AgentRunner | null = null;
+let researcher: ResearchRunner | null = null;
 // In-flight chat runs, so the renderer can abort one by id.
 const runs = new Map<string, AbortController>();
 
@@ -73,6 +75,8 @@ function createWindow(): void {
 
   // The agent. Keys live in main (config) and never cross to the renderer.
   agent = new AgentRunner(browser);
+  // The deterministic research pipeline (triggered by "/research <prompt>").
+  researcher = new ResearchRunner(browser);
 
   // A chat turn: run the agent, streaming events back tagged with the run id.
   // When browsing starts, auto-open the browser panel in the renderer.
@@ -88,8 +92,20 @@ function createWindow(): void {
         }
         mainWindow?.webContents.send("chat:event", { id, event });
       };
+      // "/research <prompt>" routes to the deterministic research pipeline; it
+      // logs/writes a trace (no UX yet). Anything else uses the working agent.
+      const researchMatch = /^\/research\s+(.+)/is.exec(task);
       try {
-        await agent?.run(task, model, send, controller.signal);
+        if (researchMatch) {
+          send({ type: "thinking" });
+          await researcher?.run(researchMatch[1].trim(), controller.signal);
+          send({
+            type: "answer",
+            text: "Research run complete — see goldie-research-trace.txt (console logged the path).",
+          });
+        } else {
+          await agent?.run(task, model, send, controller.signal);
+        }
       } finally {
         runs.delete(id);
         mainWindow?.webContents.send("chat:event", {
